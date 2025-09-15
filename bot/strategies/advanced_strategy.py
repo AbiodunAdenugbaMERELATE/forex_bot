@@ -53,37 +53,111 @@ class AdvancedStrategy(BaseStrategy):
         self.equity_stop_pct = 0.8  # Stop trading if equity drops below 80% of starting
         self.starting_equity = None
 
-    def calculate_pip_value(self):
-        """Approximate pip value per unit in account currency.
+        # --- Virtual Equity & Adaptive Sizing Controls ---
+        import os
+        self.virtual_equity = float(os.getenv("VIRTUAL_EQUITY", "0") or 0)
+        self.virtual_equity_mode = os.getenv("VIRTUAL_EQUITY_MODE", "scale").lower()  # scale | cap | adaptive
+        self.virtual_equity_initial = self.virtual_equity
+        self.adapt_participation_pct = float(os.getenv("ADAPT_PARTICIPATION_PCT", "0.25"))
+        self.adapt_max_multiplier = float(os.getenv("ADAPT_MAX_MULTIPLIER", "2.0"))
+        self.adapt_cooldown = int(os.getenv("ADAPT_COOLDOWN_SECONDS", "3600"))
+        self._last_adapt_ts = 0
+        self._peak_real_balance = None
 
-        Simplified: assumes account currency equals quote currency.
-        For JPY pairs pip is 0.01, else 0.0001. If gold/indices added later, adjust.
-        """
+        # Risk override from env
+        env_risk = os.getenv("MAX_RISK_PER_TRADE")
+        if env_risk:
+            try:
+                self.max_risk_per_trade = float(env_risk)
+            except ValueError:
+                pass
+
+        # Safety caps
+        self.max_units_cap = int(os.getenv("MAX_UNITS_CAP", "75000"))
+        self.min_stop_pips = int(os.getenv("MIN_STOP_PIPS_OVERRIDE", "15"))
+        self.margin_usage_cap_pct = float(os.getenv("MARGIN_USAGE_CAP_PCT", "0.25"))
+        self.account_currency = os.getenv("ACCOUNT_CURRENCY", "USD")
+        self.dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
+
+        # Diagnostics / adjustments
+        self.enable_position_sizing_debug = True
+        self.fixed_position_size = None
+        self.retry_shrink_factors = [0.5, 0.25]
+        self.last_rejection_time = None
+        self.rejection_cooldown = 30
+
+    def calculate_pip_value(self):
+        """Approximate pip value per unit in account currency."""
         try:
-            if 'JPY' in self.instrument:
-                return 0.01
-            return 0.0001
+            base, quote = self.instrument.split('_')
+            pip_size = 0.01 if quote == 'JPY' else 0.0001
+            if quote == self.account_currency:
+                return pip_size
+            price = float(self.data[-1]['mid']) if self.data else 1.0
+            if self.account_currency == 'USD':
+                return pip_size / price
+            return pip_size
         except Exception:
             return 0.0001
+
+    def get_effective_balance(self, real_balance: float) -> float:
+        if real_balance <= 0:
+            return real_balance
+        mode = self.virtual_equity_mode
+        if self.virtual_equity <= 0:
+            return real_balance
+        if mode == 'cap':
+            return min(real_balance, self.virtual_equity)
+        if mode == 'scale':
+            if real_balance > self.virtual_equity:
+                return self.virtual_equity
+            return real_balance
+        if mode == 'adaptive':
+            if self._peak_real_balance is None:
+                self._peak_real_balance = real_balance
+            if real_balance > self._peak_real_balance:
+                self._peak_real_balance = real_balance
+            now = time.time()
+            if now - self._last_adapt_ts > self.adapt_cooldown:
+                target = self.virtual_equity_initial + (self._peak_real_balance - self.virtual_equity_initial) * self.adapt_participation_pct
+                cap = self.virtual_equity_initial * self.adapt_max_multiplier
+                target = max(self.virtual_equity_initial, min(target, cap))
+                if target > (self.virtual_equity or 0):
+                    self.logger.info(f"[AdaptiveVirtualEquity] Raising virtual equity {self.virtual_equity} -> {target}")
+                    self.virtual_equity = target
+                self._last_adapt_ts = now
+            return min(real_balance, self.virtual_equity)
+        return real_balance
         
     def calculate_position_size(self, stop_loss_pips):
-        """Calculate position size based on account equity and risk parameters"""
         try:
-            account_info = self.api_client.get_account_summary()
-            account_balance = float(account_info.get('balance', 0) or 0)
-            if account_balance == 0 and self.starting_equity:
-                # Fallback to cached starting equity
-                account_balance = self.starting_equity
-            risk_amount = account_balance * self.max_risk_per_trade
-            
-            # Calculate pip value
-            pip_value = self.calculate_pip_value()
-            
-            # Position size = Risk Amount / (Stop Loss * Pip Value)
-            position_size = risk_amount / (stop_loss_pips * pip_value)
-            return round(position_size)
+            if stop_loss_pips < self.min_stop_pips:
+                stop_loss_pips = self.min_stop_pips
+            try:
+                acct = self.api_client.get_account_summary()
+            except Exception:
+                acct = {}
+            real_balance = float(acct.get('balance', self.starting_equity or 0) or 0)
+            effective_balance = self.get_effective_balance(real_balance)
+            if real_balance <= 0 or effective_balance <= 0:
+                self.logger.warning(f"[PositionSizing] Non-positive balance real={real_balance} eff={effective_balance}")
+                return 0
+            pip_value = self.calculate_pip_value() or 0.0001
+            risk_amount = effective_balance * self.max_risk_per_trade
+            denom = stop_loss_pips * pip_value
+            if denom <= 0:
+                self.logger.warning(f"[PositionSizing] Invalid denominator stop={stop_loss_pips} pip_value={pip_value}")
+                return 0
+            raw_size = risk_amount / denom
+            final_size = int(min(raw_size, self.max_units_cap))
+            if self.enable_position_sizing_debug:
+                self.logger.info(
+                    f"[PositionSizing] real={real_balance:.2f} eff={effective_balance:.2f} risk%={self.max_risk_per_trade} "
+                    f"riskAmt={risk_amount:.2f} stop={stop_loss_pips} pipVal={pip_value:.6f} raw={raw_size:.2f} final={final_size}"
+                )
+            return final_size
         except Exception as e:
-            self.logger.error(f"Error calculating position size: {e}")
+            self.logger.error(f"[PositionSizing] Error: {e}")
             return 0
             
     def detect_market_regime(self, df):
@@ -294,19 +368,11 @@ class AdvancedStrategy(BaseStrategy):
                     if position_size > 0 and not self.check_correlation_risk():
                         if self.should_buy(df):
                             self.logger.info(f"Buy signal generated for {self.instrument} at {timestamp}")
-                            order_result = self.api_client.place_order(
-                                self.instrument,
-                                position_size
-                            )
-                            self.handle_order_result(order_result, 'buy', position_size, timestamp)
+                            self.place_sized_order('buy', position_size, timestamp)
                             self.last_trade_time = now
                         elif self.should_sell(df):
                             self.logger.info(f"Sell signal generated for {self.instrument} at {timestamp}")
-                            order_result = self.api_client.place_order(
-                                self.instrument,
-                                -position_size
-                            )
-                            self.handle_order_result(order_result, 'sell', -position_size, timestamp)
+                            self.place_sized_order('sell', position_size, timestamp)
                             self.last_trade_time = now
         except Exception as e:
             self.logger.error(f"Error processing price update: {e}")
@@ -464,16 +530,61 @@ class AdvancedStrategy(BaseStrategy):
             return 0
 
     def calculate_position_size_volatility_adjusted(self, stop_loss_pips, df):
-        """Adjust position size based on recent volatility."""
+        """Adjust position size based on recent volatility with caps."""
+        if self.fixed_position_size is not None:
+            return self.fixed_position_size
         base_size = self.calculate_position_size(stop_loss_pips)
+        if base_size <= 0:
+            return 0
         try:
             recent_vol = df['STD20'].iloc[-1]
             avg_vol = df['STD20'].rolling(50).mean().iloc[-1]
+            adjusted = base_size
             if recent_vol > avg_vol * 1.5:
-                return int(base_size * 0.5)
+                adjusted = int(base_size * 0.5)
             elif recent_vol < avg_vol * 0.7:
-                return int(base_size * 1.2)
-            else:
-                return base_size
-        except Exception:
+                adjusted = int(base_size * 1.2)
+            if adjusted > self.max_units_cap:
+                adjusted = self.max_units_cap
+            if self.enable_position_sizing_debug:
+                self.logger.info(f"[PositionSizing] volAdj base={base_size} final={adjusted} recentVol={recent_vol:.6f} avgVol={avg_vol:.6f}")
+            return adjusted
+        except Exception as e:
+            self.logger.warning(f"[PositionSizing] Vol adjust error: {e}; using base.")
             return base_size
+
+    def pre_check_margin(self, units):
+        """Scale down units if projected margin usage exceeds cap."""
+        try:
+            acct = self.api_client.get_account_summary()
+            margin_avail = float(acct.get('marginAvailable', 0))
+            margin_rate = float(acct.get('marginRate', 0) or 0.02)
+            if margin_avail <= 0:
+                return units
+            price = float(self.data[-1]['mid']) if self.data else 1.0
+            required = abs(units) * price * margin_rate
+            cap_allowed = margin_avail * self.margin_usage_cap_pct
+            if required > cap_allowed and cap_allowed > 0:
+                scale = cap_allowed / required
+                new_units = int(units * scale)
+                self.logger.info(f"[MarginCap] Reducing units {units}->{new_units} req={required:.2f} capAllowed={cap_allowed:.2f} rate={margin_rate}")
+                return new_units
+            return units
+        except Exception:
+            return units
+
+    def place_sized_order(self, side, position_size, timestamp):
+        if position_size <= 0:
+            return
+        units = position_size if side == 'buy' else -position_size
+        units = self.pre_check_margin(units)
+        if abs(units) < 1:
+            self.logger.info("[Order] Units reduced below 1; skipping.")
+            return
+        if self.dry_run:
+            msg = f"🧪 [AdvancedStrategy] DRY_RUN {side.upper()} {units} {self.instrument} ({timestamp})"
+            self.logger.info(msg)
+            send_telegram_message(msg)
+            return
+        order_result = self.api_client.place_order(self.instrument, units)
+        self.handle_order_result(order_result, side, units, timestamp)

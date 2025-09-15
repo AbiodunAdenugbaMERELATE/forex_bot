@@ -50,6 +50,27 @@ OANDA_ACCOUNT_ID=your_oanda_account_id
 TELEGRAM_TOKEN=your_telegram_bot_token
 TELEGRAM_CHAT_ID=your_telegram_chat_id
 FMP_API_KEY=your_financial_modeling_prep_api_key
+\n+# --- Position Sizing & Virtual Equity Controls (optional) ---
+# Treat the account as if it only has this much equity (helps when demo balance is larger)
+VIRTUAL_EQUITY=2000
+# scale | cap | adaptive
+VIRTUAL_EQUITY_MODE=scale
+# Risk per trade (override dynamic adjustments) e.g. 0.005 = 0.5%
+MAX_RISK_PER_TRADE=0.005
+# Absolute ceiling on units sent in any single order
+MAX_UNITS_CAP=5000
+# Do not use more than this fraction of available margin for a new position
+MARGIN_USAGE_CAP_PCT=0.20
+# Minimum enforced stop in pips (prevents tiny stops creating huge sizes)
+MIN_STOP_PIPS_OVERRIDE=15
+# Account base currency (assumed for pip value simplification)
+ACCOUNT_CURRENCY=USD
+# adaptive mode parameters (only used if VIRTUAL_EQUITY_MODE=adaptive)
+ADAPT_PARTICIPATION_PCT=0.25
+ADAPT_MAX_MULTIPLIER=1.5
+ADAPT_COOLDOWN_SECONDS=3600
+# Dry-run mode: log signals & sizing but do not place real orders
+DRY_RUN=false
 ```
 
 ---
@@ -61,6 +82,8 @@ FMP_API_KEY=your_financial_modeling_prep_api_key
 - Places trades automatically when strategy conditions are met.
 - Sends all trade events (buy, sell, errors, warnings) to your Telegram.
 - Logs all activity to `forex_bot.log`.
+- Dynamically sizes positions using: effective_balance * risk% / (stop_loss_pips * pip_value),
+  then volatility adjustment and safety caps (virtual equity + max units + margin usage cap).
 
 ---
 
@@ -120,6 +143,12 @@ To backtest your strategy:
 - Check `forex_bot.log` for errors.
 - Ensure all API keys and credentials are correct in your `.env` file.
 - For Telegram issues, test with `python send_telegram.py`.
+- If position sizes look too large:
+   - Reduce `MAX_RISK_PER_TRADE`.
+   - Lower `MAX_UNITS_CAP`.
+   - Set `VIRTUAL_EQUITY` and `VIRTUAL_EQUITY_MODE=scale`.
+   - Increase `MIN_STOP_PIPS_OVERRIDE` if stops too tight.
+   - Check logs for `[PositionSizing]` lines to see raw vs final size.
 
 ---
 
