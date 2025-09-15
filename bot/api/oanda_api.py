@@ -14,19 +14,96 @@ class OandaAPI:
             'Authorization': f'Bearer {self.api_key}'
         }
 
-    def place_order(self, instrument, units, order_type='MARKET'):
+    def place_order(self, instrument, units, order_type='MARKET',
+                    stop_loss_price=None, take_profit_price=None, trailing_stop_distance=None):
+        """Place an order with optional bracket components.
+
+        Parameters:
+            instrument (str): e.g. 'EUR_USD'
+            units (int): positive for buy (long), negative for sell (short)
+            order_type (str): 'MARKET' only currently
+            stop_loss_price (float|None): absolute price for stop loss
+            take_profit_price (float|None): absolute price for take profit
+            trailing_stop_distance (float|None): distance in ABSOLUTE price units (not pips)
+        """
         url = f'{self.base_url}/accounts/{self.account_id}/orders'
-        order_data = {
-            "order": {
-                "units": str(units),
-                "instrument": instrument,
-                "timeInForce": "FOK",
-                "type": order_type,
-                "positionFill": "DEFAULT"
-            }
+        order = {
+            "units": str(int(units)),
+            "instrument": instrument,
+            "timeInForce": "FOK" if order_type == 'MARKET' else "GTC",
+            "type": order_type,
+            "positionFill": "DEFAULT"
         }
-        response = requests.post(url, headers=self.headers, json=order_data)
-        return response.json()
+        if stop_loss_price is not None:
+            try:
+                order["stopLossOnFill"] = {"price": f"{float(stop_loss_price):.5f}"}
+            except Exception:
+                pass
+        if take_profit_price is not None:
+            try:
+                order["takeProfitOnFill"] = {"price": f"{float(take_profit_price):.5f}"}
+            except Exception:
+                pass
+        if trailing_stop_distance is not None:
+            try:
+                order["trailingStopLossOnFill"] = {"distance": f"{float(trailing_stop_distance):.5f}"}
+            except Exception:
+                pass
+        payload = {"order": order}
+        try:
+            response = requests.post(url, headers=self.headers, json=payload, timeout=15)
+            return response.json()
+        except Exception as e:
+            return {"error": str(e), "payload": payload}
+
+    def modify_trade_stops(self, trade_id, stop_loss_price=None, take_profit_price=None, trailing_distance=None):
+        """Modify existing trade protective orders.
+
+        OANDA requires separate order objects for modifying stops/TP. This method attempts
+        to submit the relevant amendments. If nothing provided, returns early.
+        """
+        if not any([stop_loss_price, take_profit_price, trailing_distance]):
+            return {"error": "No modifications specified"}
+        url = f'{self.base_url}/accounts/{self.account_id}/trades/{trade_id}/orders'
+        orders = []
+        if stop_loss_price is not None:
+            try:
+                orders.append({
+                    "type": "STOP_LOSS",
+                    "tradeID": str(trade_id),
+                    "price": f"{float(stop_loss_price):.5f}",
+                    "timeInForce": "GTC"
+                })
+            except Exception:
+                pass
+        if take_profit_price is not None:
+            try:
+                orders.append({
+                    "type": "TAKE_PROFIT",
+                    "tradeID": str(trade_id),
+                    "price": f"{float(take_profit_price):.5f}",
+                    "timeInForce": "GTC"
+                })
+            except Exception:
+                pass
+        if trailing_distance is not None:
+            try:
+                orders.append({
+                    "type": "TRAILING_STOP_LOSS",
+                    "tradeID": str(trade_id),
+                    "distance": f"{float(trailing_distance):.5f}",
+                    "timeInForce": "GTC"
+                })
+            except Exception:
+                pass
+        if not orders:
+            return {"error": "No valid orders built"}
+        payload = {"orders": orders}
+        try:
+            r = requests.post(url, headers=self.headers, json=payload, timeout=15)
+            return r.json()
+        except Exception as e:
+            return {"error": str(e), "payload": payload}
 
     def get_account_summary(self):
         """Return basic account summary including balance used for position sizing."""
