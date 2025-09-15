@@ -52,12 +52,28 @@ class AdvancedStrategy(BaseStrategy):
         self.max_open_trades = 3
         self.equity_stop_pct = 0.8  # Stop trading if equity drops below 80% of starting
         self.starting_equity = None
+
+    def calculate_pip_value(self):
+        """Approximate pip value per unit in account currency.
+
+        Simplified: assumes account currency equals quote currency.
+        For JPY pairs pip is 0.01, else 0.0001. If gold/indices added later, adjust.
+        """
+        try:
+            if 'JPY' in self.instrument:
+                return 0.01
+            return 0.0001
+        except Exception:
+            return 0.0001
         
     def calculate_position_size(self, stop_loss_pips):
         """Calculate position size based on account equity and risk parameters"""
         try:
             account_info = self.api_client.get_account_summary()
-            account_balance = float(account_info['balance'])
+            account_balance = float(account_info.get('balance', 0) or 0)
+            if account_balance == 0 and self.starting_equity:
+                # Fallback to cached starting equity
+                account_balance = self.starting_equity
             risk_amount = account_balance * self.max_risk_per_trade
             
             # Calculate pip value
@@ -294,6 +310,38 @@ class AdvancedStrategy(BaseStrategy):
                             self.last_trade_time = now
         except Exception as e:
             self.logger.error(f"Error processing price update: {e}")
+
+    def should_trade(self, df):
+        """Aggregate pre-trade checks. Returns True if strategy is allowed to evaluate entry signals.
+
+        Checks include:
+        - Sufficient data length for indicators
+        - Not during high-impact news window
+        - Market regime not unknown (after enough data)
+        - Basic sanity on recent volatility (avoid NaNs)
+        """
+        try:
+            # Need enough data for SMAs & momentum lookbacks
+            if len(df) < 120:
+                return False
+            # Avoid NaNs in required columns
+            required_cols = ['SMA20', 'SMA50', 'STD20']
+            for col in required_cols:
+                if df[col].isna().iloc[-1]:
+                    return False
+            # News filter
+            if self.is_news_time():
+                self.logger.info(f"Skipping trade due to news window for {self.instrument}")
+                return False
+            # Optional regime filter (only after lookback size)
+            if len(df) >= self.regime_lookback:
+                regime = self.detect_market_regime(df)
+                if regime == 'unknown':
+                    return False
+            return True
+        except Exception as e:
+            self.logger.warning(f"should_trade check failed (defaulting False): {e}")
+            return False
             
     def calculate_dynamic_stop_loss(self, df):
         """Calculate dynamic stop loss based on volatility"""
@@ -316,7 +364,13 @@ class AdvancedStrategy(BaseStrategy):
         try:
             response = requests.get(url, timeout=10)
             if response.status_code != 200:
-                self.logger.warning(f"FMP API error: {response.text}")
+                # Detect legacy / deprecation message and permanently disable further calls this session
+                txt = response.text
+                if 'Legacy Endpoint' in txt or 'legacy' in txt.lower():
+                    self.logger.warning("FMP economic calendar endpoint legacy notice. Disabling news filter for this run.")
+                    self.is_news_time = lambda : False  # monkey-patch to skip future HTTP calls
+                    return False
+                self.logger.warning(f"FMP API error: {txt}")
                 return False
             events = response.json()
             now = datetime.utcnow()

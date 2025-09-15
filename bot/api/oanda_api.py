@@ -27,3 +27,29 @@ class OandaAPI:
         }
         response = requests.post(url, headers=self.headers, json=order_data)
         return response.json()
+
+    def get_account_summary(self):
+        """Return basic account summary including balance used for position sizing."""
+        url = f'{self.base_url}/accounts/{self.account_id}/summary'
+        r = requests.get(url, headers=self.headers, timeout=10)
+        data = r.json()
+        # Normalize to expected structure
+        if 'account' in data:
+            account = data['account']
+            return {
+                'balance': account.get('balance'),
+                'currency': account.get('currency'),
+                'unrealizedPL': account.get('unrealizedPL'),
+                'NAV': account.get('NAV')
+            }
+        return {'balance': 0}
+
+    def get_open_trades_count(self, instrument=None):
+        """Return number of open trades (optionally filtered by instrument)."""
+        url = f'{self.base_url}/accounts/{self.account_id}/openTrades'
+        r = requests.get(url, headers=self.headers, timeout=10)
+        data = r.json()
+        trades = data.get('trades', [])
+        if instrument:
+            trades = [t for t in trades if t.get('instrument') == instrument]
+        return len(trades)
