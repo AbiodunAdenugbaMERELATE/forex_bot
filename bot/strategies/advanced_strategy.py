@@ -920,7 +920,7 @@ class AdvancedStrategy(BaseStrategy):
         
         return trend_signal and volatility_suitable and momentum_negative
     
-    def handle_order_result(self, order_result, side, units, timestamp):
+    def handle_order_result(self, order_result, side, units, timestamp, intended_sl=None, intended_tp=None):
         """Handle order response; extended to log bracket details if present."""
         strategy_name = "AdvancedStrategy"
         try:
@@ -944,12 +944,26 @@ class AdvancedStrategy(BaseStrategy):
                         tp = fill['takeProfitOnFill'].get('price')
                 except Exception:
                     pass
+                # Some OANDA responses include separate transactions for SL/TP
+                try:
+                    if not sl and 'stopLossOrderTransaction' in order_result:
+                        sl = order_result['stopLossOrderTransaction'].get('price')
+                    if not tp and 'takeProfitOrderTransaction' in order_result:
+                        tp = order_result['takeProfitOrderTransaction'].get('price')
+                except Exception:
+                    pass
                 trade_id = None
                 try:
                     trade_opened = fill.get('tradeOpened') or {}
                     trade_id = trade_opened.get('tradeID') or trade_opened.get('id')
                 except Exception:
                     trade_id = None
+                # Fallback to intended values if broker did not echo bracket
+                if (sl is None or tp is None) and (intended_sl is not None or intended_tp is not None):
+                    if sl is None:
+                        sl = intended_sl
+                    if tp is None:
+                        tp = intended_tp
                 # Enhanced direction & visual formatting
                 direction_emoji = '🟢' if side == 'buy' else '🔴'
                 side_label = 'LONG' if side == 'buy' else 'SHORT'
@@ -977,6 +991,24 @@ class AdvancedStrategy(BaseStrategy):
                     except Exception:
                         pass
                 self._journal_write('filled', side=side, units=units, price=price, sl=sl, tp=tp, trade_id=trade_id, pl=pl)
+                # If still missing protective orders, attempt to attach them now
+                try:
+                    if trade_id and (sl is None or tp is None) and (intended_sl or intended_tp):
+                        attach_sl = intended_sl if sl is None else None
+                        attach_tp = intended_tp if tp is None else None
+                        if attach_sl or attach_tp:
+                            r = self.api_client.modify_trade_stops(trade_id, stop_loss_price=attach_sl, take_profit_price=attach_tp)
+                            self.logger.info(f"[BracketAttach] Attempted attach SL={attach_sl} TP={attach_tp} resp={r}")
+                            send_telegram_message(f"🔧 [AdvancedStrategy] Added missing protective orders trade {trade_id} SL={attach_sl} TP={attach_tp}")
+                            # Update local record if success heuristically
+                            ot = self._open_trades.get(trade_id)
+                            if ot:
+                                if attach_sl and ot.get('sl') is None:
+                                    ot['sl'] = attach_sl
+                                if attach_tp and ot.get('tp') is None:
+                                    ot['tp'] = attach_tp
+                except Exception as _e:
+                    self.logger.warning(f"[BracketAttach] failed: {_e}")
                 # Adaptive risk contraction: treat negative pl as loss
                 try:
                     if self.enable_adaptive_risk and pl is not None:
@@ -1207,4 +1239,4 @@ class AdvancedStrategy(BaseStrategy):
         )
         self._journal_write('submitted', side=side, units=units, dry_run=False, sl=sl_price, tp=tp_price,
                             stop_pips=stop_loss_pips)
-        self.handle_order_result(order_result, side, units, timestamp)
+        self.handle_order_result(order_result, side, units, timestamp, intended_sl=sl_price, intended_tp=tp_price)
